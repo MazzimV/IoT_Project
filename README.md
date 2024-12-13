@@ -12,4 +12,5 @@ EC2_Instance_Notebook is where the model is imported and run on the imported dat
 
 activity_sleep_data.csv is the data collected by lambda and stored in S3.
 
-
+DataPullS3 is the code for the data pull from S3
+Led_light.ino is the code for the dimmming of the LED light over the course of an hour
