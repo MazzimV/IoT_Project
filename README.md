@@ -16,5 +16,8 @@ DataPullS3 is the code for connecting my ESP32 to wifi and pulling the data from
 
 Led_light.ino is the code for the dimmming of the LED light over the course of an hour
 
+Link to Quicksight dashboard:  https://eu-west-1.quicksight.aws.amazon.com/sn/accounts/940482424370/dashboards/8f4df945-c790-4018-931f-5f1b6abdde5e?directory_alias=MaximeVergnaud1
+Username and Password contained in turnitin report submission.
+
 
 
