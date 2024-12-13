@@ -9,3 +9,5 @@ XGB_Model is the notebook containing the training of the model on historic weath
 EC2_Instance_Notebook is where the model is imported and run on the imported data from S3 to generate a predicted bedtime for the most recent data.
 
 activity_sleep_data.csv is the data collected by lambda and stored in S3.
+
+AWS_lambda code is the code used to collect the data in lambda.
