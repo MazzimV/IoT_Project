@@ -1,0 +1,238 @@
+import pandas as pd
+import json
+import logging
+import boto3
+import requests
+from datetime import datetime, timedelta, timezone
+from oura_ring import OuraClient
+from io import StringIO
+import joblib
+
+# API constants
+API_KEY = '2095abe1b2b361dfcaadf493c02be9a5'
+LOCATION = "Fulham"
+CURRENT_URL = "http://api.weatherstack.com/current"
+HISTORICAL_URL = "http://api.weatherstack.com/historical"
+
+# Columns for weather data
+columns = [
+    'temp', 'feelslike', 'dew', 'humidity', 'precip',
+    'windspeed', 'winddir', 'pressure', 'cloudcover', 'visibility',
+    'uvindex', 'sunrise', 'sunset',
+]
+
+# Timezone handling 
+UTC_OFFSET = 0 
+local_tz = timezone(timedelta(hours=UTC_OFFSET))
+now = datetime.now(local_tz)
+today_date = now.strftime('%Y-%m-%d')
+tomorrow_date = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+
+def convert_to_24hr_format(time_str):
+    """Convert time string (AM/PM format) to 24-hour format."""
+    try:
+        time_obj = datetime.strptime(time_str, "%I:%M %p")
+        return time_obj.strftime("%H:%M")
+    except ValueError:
+        return None
+
+def minutes_from_midnight(time_str):
+    hours, minutes = map(int, time_str.split(":"))
+    return hours * 60 + minutes
+       
+
+def fetch_current_weather(api_key, location):
+    """Fetch current weather data for the specified location."""
+    params = {
+        'access_key': api_key,
+        'query': location,
+        'units': 'm' 
+    }
+    try:
+        response = requests.get(CURRENT_URL, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            if not data.get("success", True):
+                logging.error(f"Error fetching current weather data: {data['error']['info']}")
+                return None
+            else:
+                current = data.get('current', {})
+                location_data = data.get('location', {})
+                
+                weather_entry = {
+                    'temp': current.get('temperature'),
+                    'feelslike': current.get('feelslike'),
+                    'humidity': current.get('humidity'),
+                    'precip': current.get('precip'),
+                    'windspeed': current.get('wind_speed'),
+                    'winddir': current.get('wind_degree'),
+                    'pressure': current.get('pressure'),
+                    'cloudcover': current.get('cloudcover'),
+                    'visibility': current.get('visibility'),
+                    'uvindex': current.get('uv_index'),
+                }
+
+                weather_df = pd.DataFrame([weather_entry]) if weather_entry else pd.DataFrame(columns=columns)
+
+                weather_df.columns = ['weather_' + col if col != 'weather_timestamp' else col for col in weather_df.columns]
+                return weather_df
+        else:
+            logging.error(f"HTTP Error: {response.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+        return None
+
+def fetch_historical_weather(api_key, location, date):
+    """Fetch historical weather data (sunrise and sunset) for the specified location and date."""
+    params = {
+        'access_key': api_key,
+        'query': location,
+        'historical_date': date,
+        'units': 'm'  
+    }
+    try:
+        response = requests.get(HISTORICAL_URL, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            if not data.get("success", True):
+                logging.error(f"Error fetching historical weather data: {data['error']['info']}")
+                return None
+            else:
+                historical = data.get('historical', {}).get(date, {})
+                astro = historical.get('astro', {})  
+                sunrise = astro.get('sunrise', None)
+                sunset = astro.get('sunset', None)
+
+                return {'sunrise': sunrise, 'sunset': sunset}
+        else:
+            logging.error(f"HTTP Error: {response.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+        return None
+
+# Fetch weather data
+def fetch_weather(api_key, location):
+    """Fetch both current and historical weather data."""
+    current_weather_df = fetch_current_weather(api_key, location)
+    
+    if current_weather_df is None:
+        logging.error("Error fetching current weather data.")
+        return None
+
+    # Fetch historical weather data
+    historical_data = fetch_historical_weather(api_key, location, today_date)
+    
+    if historical_data is None:
+        logging.error("Error fetching historical weather data.")
+        return None
+
+    current_weather_df['weather_sunrise'] = historical_data.get('sunrise', None)
+    current_weather_df['weather_sunset'] = historical_data.get('sunset', None)
+
+    return current_weather_df
+
+# Fetch Oura data
+def fetch_oura_data(client, start_date, end_date):
+    """Fetch and process Oura activity and sleep data."""
+    try:
+        # Fetch activity data
+        activity_data = client.get_daily_activity(start_date=start_date, end_date=end_date)
+        activity_df = pd.json_normalize(activity_data, sep='_') if activity_data else pd.DataFrame()
+
+        if not activity_df.empty:
+            for col in activity_df.columns:
+                if activity_df[col].apply(lambda x: isinstance(x, list)).any():
+                    activity_df[col] = activity_df[col].apply(lambda x: ', '.join(map(str, x)) if isinstance(x, list) else x)
+
+        # Fetch sleep data
+        sleep_data = client.get_daily_sleep(start_date=start_date, end_date=end_date)
+        sleep_df = pd.json_normalize(sleep_data, sep='_') if sleep_data else pd.DataFrame()
+
+        # Formatting
+        if 'day' in sleep_df.columns:
+            sleep_df.drop(columns=['day'], inplace=True)
+        if 'id' in sleep_df.columns:
+            sleep_df.drop(columns=['id'], inplace=True)
+        if 'score' in sleep_df.columns:
+            sleep_df.rename(columns={'score': 'sleep_score'}, inplace=True)
+
+        return activity_df, sleep_df
+
+    except Exception as e:
+        logging.error(f"Error fetching Oura data: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+def lambda_handler(event, context):
+    """AWS Lambda function handler."""
+    try:
+        # Set up the Oura Client
+        personal_access_token = "CJKKWLRKXUMQLF74N4Z75RJW7XE7IKUN"
+        client = OuraClient(personal_access_token)
+
+        # Fetch data from APIs
+        activity_df, sleep_df = fetch_oura_data(client, today_date, tomorrow_date)
+        weather_df = fetch_weather(API_KEY, LOCATION)
+        
+        activity_df.reset_index(drop=True, inplace=True)
+        sleep_df.reset_index(drop=True, inplace=True)
+        weather_df.reset_index(drop=True, inplace=True)
+
+        if 'timestamp' in activity_df.columns:
+            activity_df.rename(columns={'timestamp': 'activity_timestamp'}, inplace=True)
+        if 'timestamp' in weather_df.columns:
+            weather_df.rename(columns={'timestamp': 'weather_timestamp'}, inplace=True)
+
+        # Combine DataFrames
+        combined_df = pd.concat([activity_df, sleep_df, weather_df], axis=1, ignore_index=False)
+
+        columns_to_remove = ['weather_windgust', 'weather_temperature', 'weather_condition']
+
+        # Remove the unwanted columns
+        combined_df.drop(columns=[col for col in columns_to_remove if col in combined_df.columns], inplace=True)
+
+        # Add export timestamp
+        export_timestamp = datetime.now(local_tz).strftime('%Y-%m-%d %H:%M:%S')
+        combined_df.insert(0, 'export_timestamp', export_timestamp)
+
+        combined_df['weather_sunrise'] = combined_df['weather_sunrise'].apply(convert_to_24hr_format)
+        combined_df['weather_sunset'] = combined_df['weather_sunset'].apply(convert_to_24hr_format)
+
+        combined_df['Sunrise Minutes'] = combined_df['weather_sunrise'].apply(minutes_from_midnight)
+        combined_df['Sunset Minutes'] = combined_df['weather_sunset'].apply(minutes_from_midnight)
+
+        # S3 setup
+        s3 = boto3.client('s3')
+        s3_bucket_name = 'apidataforiotproject'
+        s3_key = "activity_sleep_weather_data.csv"
+
+        # Check if file exists on S3
+        try:
+            response = s3.get_object(Bucket=s3_bucket_name, Key=s3_key)
+            existing_data = pd.read_csv(StringIO(response['Body'].read().decode('utf-8')))
+            existing_data.reset_index(drop=True, inplace=True)
+            combined_df.reset_index(drop=True, inplace=True)
+
+            # Concatenate existing and new data
+            updated_data = pd.concat([existing_data, combined_df], ignore_index=True)
+        except s3.exceptions.NoSuchKey:
+            updated_data = combined_df
+
+        # Save to S3
+        csv_buffer = StringIO()
+        updated_data.to_csv(csv_buffer, index=False)
+        s3.put_object(Bucket=s3_bucket_name, Key=s3_key, Body=csv_buffer.getvalue())
+
+        logging.info("Data successfully updated in S3")
+        return {
+            "statusCode": 200,
+            "message": "Activity, sleep, and weather data successfully updated in S3"
+        }
+
+    except Exception as e:
+        logging.error(f"Error: {str(e)}")
+        return {
+            "statusCode": 500,
+            "error": str(e)
+        }
